@@ -1,6 +1,8 @@
-import { createHash } from 'crypto'
+import { createHash, randomBytes } from 'crypto'
 import { facilitator, decodePaymentSignatureHeader, encodePaymentRequiredHeader } from './x402.js'
 import db from './db.js'
+
+export const INTERNAL_TOKEN = randomBytes(32).toString('hex')
 
 const OPENROUTER_API = 'https://openrouter.ai/api/v1'
 
@@ -71,6 +73,19 @@ export function registerGatewayRoutes(app, nwcClient) {
     const tier      = getModelTier(modelId)
     const priceSats = TIER_SATS[tier]
     const x402Reqs  = getX402Requirements(tier)
+
+    // ── 0. Internal bypass (MCP tool calls, same-process only) ──────────
+    if (req.headers['x-internal-token'] === INTERNAL_TOKEN) {
+      try {
+        const upstream = await forwardToOpenRouter(body)
+        const data = await upstream.json()
+        if (!upstream.ok) return res.status(upstream.status).json(data)
+        return res.json(data)
+      } catch (e) {
+        console.error('Gateway forward error (internal):', e.message)
+        return res.status(502).json({ error: 'Upstream provider error' })
+      }
+    }
 
     // ── 1. Check L402 (Lightning) ───────────────────────────────────────
     const auth = req.headers.authorization

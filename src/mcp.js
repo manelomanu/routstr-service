@@ -2,6 +2,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js'
 import { z } from 'zod'
 import db from './db.js'
+import { INTERNAL_TOKEN } from './gateway.js'
+
+const GATEWAY_URL = `http://localhost:${process.env.PORT || 3000}`
 
 function getProviders() {
   return db.prepare(`
@@ -132,6 +135,49 @@ function createMcpServer() {
         },
       }
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+    }
+  )
+
+  server.tool(
+    'run_inference',
+    'Run AI inference through the AIRadar gateway. Supports 337+ models via OpenRouter. No payment required when called from this MCP server.',
+    {
+      model:       z.string().describe('Model ID — use find_model or list from GET /v1/models (e.g. openai/gpt-4o, google/gemma-3-27b-it:free, anthropic/claude-3-5-sonnet)'),
+      messages:    z.array(z.object({
+        role:    z.enum(['user', 'assistant', 'system']),
+        content: z.string(),
+      })).describe('Conversation messages in OpenAI format'),
+      temperature: z.number().min(0).max(2).optional().describe('Sampling temperature 0–2 (default: model default)'),
+      max_tokens:  z.number().int().positive().optional().describe('Maximum tokens to generate'),
+    },
+    async ({ model, messages, temperature, max_tokens }) => {
+      const body = { model, messages }
+      if (temperature != null) body.temperature = temperature
+      if (max_tokens   != null) body.max_tokens   = max_tokens
+
+      let response, data
+      try {
+        response = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
+          method:  'POST',
+          headers: {
+            'Content-Type':      'application/json',
+            'X-Internal-Token':  INTERNAL_TOKEN,
+          },
+          body:    JSON.stringify(body),
+          signal:  AbortSignal.timeout(60000),
+        })
+        data = await response.json()
+      } catch (e) {
+        return { content: [{ type: 'text', text: `Gateway error: ${e.message}` }] }
+      }
+
+      if (!response.ok) {
+        return { content: [{ type: 'text', text: `Upstream error (${response.status}): ${JSON.stringify(data)}` }] }
+      }
+
+      const reply = data.choices?.[0]?.message?.content
+      if (!reply) return { content: [{ type: 'text', text: JSON.stringify(data) }] }
+      return { content: [{ type: 'text', text: reply }] }
     }
   )
 

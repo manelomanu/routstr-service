@@ -116,7 +116,7 @@ export function initServer() {
         'GET /mcp': {
           description: 'MCP server (SSE transport). Compatible with Claude, ElizaOS, and any MCP-compatible agent framework.',
           auth: 'none',
-          tools: ['list_providers', 'find_model', 'route', 'compare_prices'],
+          tools: ['list_providers', 'find_model', 'route', 'compare_prices', 'run_inference'],
         },
       },
       data_source: {
