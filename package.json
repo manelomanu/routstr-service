@@ -1,0 +1,21 @@
+{
+  "name": "routstr-service",
+  "version": "1.0.0",
+  "description": "Routstr provider directory with L402 payments",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@getalby/sdk": "^8.0.3",
+    "better-sqlite3": "^12.10.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "node-fetch": "^2.7.0",
+    "nostr-tools": "^2.23.5"
+  }
+}
