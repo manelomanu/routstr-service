@@ -17,8 +17,9 @@ const SOL_ADDRESS = 'AP8Q9QaYQ1etKFuUVQdd8RpGCWYH4QLDREfnd76KJX3m'
 const PRICE_USDC  = '10000' // $0.01 in USDC micro-units (6 decimals)
 
 const X402_REQUIREMENTS = [
-  { scheme: 'exact', network: 'base',    maxAmountRequired: PRICE_USDC, resource: 'https://airadar.fyi/providers', description: 'AIRadar — AI provider directory', mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', extra: { name: 'USD Coin', version: '2' } },
-  { scheme: 'exact', network: 'polygon', maxAmountRequired: PRICE_USDC, resource: 'https://airadar.fyi/providers', description: 'AIRadar — AI provider directory', mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359', extra: { name: 'USD Coin', version: '2' } },
+  { scheme: 'exact', network: 'base',           maxAmountRequired: PRICE_USDC, resource: 'https://airadar.fyi/providers', description: 'AIRadar — AI provider directory', mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',         extra: { name: 'USD Coin', version: '2' } },
+  { scheme: 'exact', network: 'polygon',        maxAmountRequired: PRICE_USDC, resource: 'https://airadar.fyi/providers', description: 'AIRadar — AI provider directory', mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',         extra: { name: 'USD Coin', version: '2' } },
+  { scheme: 'exact', network: 'eip155:42161',   maxAmountRequired: PRICE_USDC, resource: 'https://airadar.fyi/providers', description: 'AIRadar — AI provider directory', mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',         extra: { name: 'USD Coin', version: '2' } },
   { scheme: 'exact', network: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', maxAmountRequired: PRICE_USDC, resource: 'https://airadar.fyi/providers', description: 'AIRadar — AI provider directory', mimeType: 'application/json', payTo: SOL_ADDRESS, maxTimeoutSeconds: 300, asset: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', extra: {} },
 ]
 
@@ -99,6 +100,12 @@ export function initServer() {
           description: 'Free preview: top 3 online providers. No payment required.',
           auth: 'none',
         },
+        'GET /providers/best': {
+          description: 'Returns the single best provider for a given model. Designed for agents: one call, one answer.',
+          auth: 'pay-per-use',
+          params: { model: 'model ID (optional)', optimize: 'price (default) | speed | reliability' },
+          returns: '{ best: { provider, model, endpoint, pricing, response_ms }, how_to_use, alternatives[] }',
+        },
         'GET /providers/:pubkey': {
           description: 'Full detail for a single provider including all models.',
           auth: 'pay-per-use',
@@ -138,6 +145,7 @@ export function initServer() {
 
   app.get('/free', getFreeProviders)
   app.get('/providers', requirePayment, getProviders)
+  app.get('/providers/best', requirePayment, getBestProvider)
   app.get('/providers/:pubkey', requirePayment, getProviderDetail)
   app.get('/models', requirePayment, getModels)
   app.post('/route', requirePayment, routeRequest)
@@ -255,6 +263,7 @@ function formatProvider(p, models) {
     onion_url:   p.onion_url || null,
     mints:       parsedMints,
     network:     p.network || 'routstr',
+    access_type: p.network === 'antseed' ? 'p2p' : 'http',
     auth_type:   p.auth_type || 'lightning',
     child_key_cost_msats: p.child_key_cost_msats || 0,
     status: {
@@ -410,6 +419,79 @@ function getFreeProviders(_req, res) {
     updated_at: new Date().toISOString(),
     count: providers.length,
     providers: providers.map(p => formatProvider(p, modelsMap[p.pubkey] || [])),
+  })
+}
+
+function getBestProvider(req, res) {
+  const { model, optimize = 'price' } = req.query
+
+  let query = `
+    SELECT m.*, p.name as provider_name, p.endpoint, p.is_online,
+           p.response_ms, p.uptime_ok_24h, p.uptime_total_24h,
+           p.network as provider_network, p.auth_type
+    FROM models m
+    JOIN providers p ON m.provider_pubkey = p.pubkey
+    WHERE m.enabled = 1 AND p.is_online = 1
+  `
+  const params = []
+
+  if (model) {
+    query += ' AND (m.id = ? OR m.canonical_id = ?)'
+    params.push(model, model)
+  }
+
+  if (optimize === 'speed') {
+    query += ' ORDER BY p.response_ms ASC NULLS LAST, m.pricing_usd_per_1k_prompt ASC NULLS LAST'
+  } else if (optimize === 'reliability') {
+    query += ` ORDER BY CASE WHEN p.uptime_total_24h > 0
+      THEN CAST(p.uptime_ok_24h AS REAL) / p.uptime_total_24h ELSE NULL END DESC NULLS LAST,
+      p.response_ms ASC NULLS LAST`
+  } else {
+    query += ' ORDER BY m.pricing_usd_per_1k_prompt ASC NULLS LAST, p.response_ms ASC NULLS LAST'
+  }
+
+  query += ' LIMIT 5'
+
+  const results = db.prepare(query).all(...params)
+
+  if (results.length === 0) {
+    const msg = model ? `No online provider found for model "${model}"` : 'No online providers found'
+    return res.status(404).json({ error: msg })
+  }
+
+  const best = results[0]
+  res.json({
+    optimized_for: optimize,
+    model: model || best.id,
+    best: {
+      provider:    best.provider_name,
+      pubkey:      best.provider_pubkey,
+      model:       best.id,
+      endpoint:    best.endpoint,
+      network:     best.provider_network || 'routstr',
+      auth_type:   best.auth_type || 'lightning',
+      response_ms: best.response_ms,
+      uptime_24h:  best.uptime_total_24h > 0
+        ? Math.round((best.uptime_ok_24h / best.uptime_total_24h) * 100)
+        : null,
+      pricing: {
+        usd_per_1k_prompt:     best.pricing_usd_per_1k_prompt,
+        usd_per_1k_completion: best.pricing_usd_per_1k_completion,
+      },
+    },
+    how_to_use: {
+      url:    `${best.endpoint}/v1/chat/completions`,
+      method: 'POST',
+      body:   { model: best.id, messages: [{ role: 'user', content: '...' }] },
+    },
+    alternatives: results.slice(1).map(m => ({
+      provider:    m.provider_name,
+      pubkey:      m.provider_pubkey,
+      model:       m.id,
+      endpoint:    m.endpoint,
+      response_ms: m.response_ms,
+      pricing:     { usd_per_1k_prompt: m.pricing_usd_per_1k_prompt },
+    })),
   })
 }
 

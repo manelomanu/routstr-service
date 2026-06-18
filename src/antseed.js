@@ -28,13 +28,14 @@ export async function syncAntSeed() {
       ? (addr.startsWith('http') ? addr : `http://${addr}`)
       : null
 
+    // AntSeed uses P2P routing (not direct HTTP) — is_online = 0 means not HTTP-accessible
     db.prepare(`
       INSERT INTO providers (pubkey, name, endpoint, network, auth_type, is_online, last_seen)
-      VALUES (?, ?, ?, 'antseed', 'usdc', 1, ?)
+      VALUES (?, ?, ?, 'antseed', 'usdc', 0, ?)
       ON CONFLICT(pubkey) DO UPDATE SET
         name      = excluded.name,
         endpoint  = COALESCE(excluded.endpoint, endpoint),
-        is_online = 1,
+        is_online = 0,
         last_seen = excluded.last_seen
     `).run(pubkey, peer.displayName || pubkey.slice(0, 16), endpoint, now)
     providers++

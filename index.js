@@ -23,6 +23,6 @@ setInterval(checkAllProviders, 5 * 60 * 1000)
 syncOpenRouter()
 setInterval(syncOpenRouter, 30 * 60 * 1000)
 
-// AntSeed: DHT discovery every 30 minutes
+// AntSeed: sync from stats API every 30 minutes, healthcheck every 5 minutes
 syncAntSeed()
 setInterval(syncAntSeed, 30 * 60 * 1000)

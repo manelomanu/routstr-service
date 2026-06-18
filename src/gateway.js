@@ -42,8 +42,9 @@ function getX402Requirements(tier) {
   const resource = 'https://airadar.fyi/v1/chat/completions'
   const description = `AIRadar Gateway — ${tier} tier`
   return [
-    { scheme: 'exact', network: 'base',    maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', extra: { name: 'USD Coin', version: '2' } },
-    { scheme: 'exact', network: 'polygon', maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359', extra: { name: 'USD Coin', version: '2' } },
+    { scheme: 'exact', network: 'base',           maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',         extra: { name: 'USD Coin', version: '2' } },
+    { scheme: 'exact', network: 'polygon',        maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',         extra: { name: 'USD Coin', version: '2' } },
+    { scheme: 'exact', network: 'eip155:42161',   maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',         extra: { name: 'USD Coin', version: '2' } },
     { scheme: 'exact', network: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: SOL_ADDRESS, maxTimeoutSeconds: 300, asset: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', extra: {} },
   ]
 }
@@ -62,6 +63,46 @@ async function forwardToOpenRouter(body) {
     signal: AbortSignal.timeout(60000),
   })
   return res
+}
+
+function findExternalProvider(modelId) {
+  if (!modelId) return null
+  return db.prepare(`
+    SELECT p.pubkey, p.name, p.endpoint, p.network, p.auth_type, p.response_ms
+    FROM models m
+    JOIN providers p ON m.provider_pubkey = p.pubkey
+    WHERE m.id = ? AND p.is_online = 1 AND p.endpoint IS NOT NULL
+      AND p.network IN ('antseed', 'routstr')
+      AND m.enabled = 1
+    ORDER BY p.response_ms ASC NULLS LAST
+    LIMIT 1
+  `).get(modelId)
+}
+
+async function forwardBest(body) {
+  const external = findExternalProvider(body.model)
+
+  if (external) {
+    try {
+      const base = external.endpoint.replace(/\/$/, '')
+      const res = await fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...body, stream: false }),
+        signal: AbortSignal.timeout(30_000),
+      })
+      if (res.ok) {
+        console.log(`[route] ${body.model} → ${external.name} (${external.network})`)
+        return { res, provider: external.name, network: external.network }
+      }
+      console.log(`[route] ${external.name} returned HTTP ${res.status} — fallback to OpenRouter`)
+    } catch (e) {
+      console.log(`[route] ${external.name} failed (${e.message}) — fallback to OpenRouter`)
+    }
+  }
+
+  const res = await forwardToOpenRouter(body)
+  return { res, provider: 'openrouter', network: 'openrouter' }
 }
 
 export function registerGatewayRoutes(app, nwcClient) {
@@ -112,10 +153,10 @@ export function registerGatewayRoutes(app, nwcClient) {
                 .run(Math.floor(Date.now() / 1000), paymentHash)
 
               try {
-                const upstream = await forwardToOpenRouter(body)
+                const { res: upstream, provider, network } = await forwardBest(body)
                 const data = await upstream.json()
                 if (!upstream.ok) return res.status(upstream.status).json(data)
-                return res.json(data)
+                return res.set('X-Served-By', `${network}/${provider}`).json(data)
               } catch (e) {
                 console.error('Gateway forward error:', e.message)
                 return res.status(502).json({ error: 'Upstream provider error. Your payment has been recorded — contact support.' })
@@ -146,10 +187,10 @@ export function registerGatewayRoutes(app, nwcClient) {
           ).run(settleId, `x402:${payload.network}`, Math.floor(Date.now() / 1000), Math.floor(Date.now() / 1000))
 
           try {
-            const upstream = await forwardToOpenRouter(body)
+            const { res: upstream, provider, network } = await forwardBest(body)
             const data = await upstream.json()
             if (!upstream.ok) return res.status(upstream.status).json(data)
-            return res.json(data)
+            return res.set('X-Served-By', `${network}/${provider}`).json(data)
           } catch (e) {
             console.error('Gateway forward error (x402):', e.message)
             return res.status(502).json({ error: `Upstream provider error. Your USDC payment was settled (ref: ${settleId}). Contact support.` })
