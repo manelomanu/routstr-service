@@ -1,27 +1,56 @@
+import { createHash } from 'crypto'
 import express from 'express'
 import { NWCClient } from '@getalby/sdk'
 import { facilitator, decodePaymentSignatureHeader, encodePaymentRequiredHeader } from './x402.js'
 import db from './db.js'
 import { registerMcpRoutes, setJsonMiddleware } from './mcp.js'
-import { registerGatewayRoutes } from './gateway.js'
+import { registerGatewayRoutes, INTERNAL_TOKEN } from './gateway.js'
+import { searchWeb, searchBackend } from './search.js'
+import { fetchUrl } from './fetch.js'
+import { registerMemoryRoutes } from './memory.js'
+import { registerDataRoutes } from './data.js'
+import { registerAiRoutes } from './ai-tools.js'
+import { registerComputeRoutes } from './compute.js'
+import { registerStateRoutes } from './state.js'
+import { analyticsMiddleware, registerAnalyticsRoutes } from './analytics.js'
+import { registerReputationRoutes } from './reputation.js'
+import { registerOpenApiRoutes } from './openapi.js'
 
 const app = express()
 const jsonMiddleware = express.json()
 app.use(jsonMiddleware)
 setJsonMiddleware(jsonMiddleware)
-const PRICE_SATS = parseInt(process.env.PRICE_SATS || '10')
+const PRICE_SATS  = parseInt(process.env.PRICE_SATS || '10')
+const SEARCH_SATS = 5
 const PORT = parseInt(process.env.PORT || '3000')
 
-const EVM_ADDRESS = '0x7698672ceE929D3f0fA3c773111b4D6b0095aa1A'
-const SOL_ADDRESS = 'AP8Q9QaYQ1etKFuUVQdd8RpGCWYH4QLDREfnd76KJX3m'
-const PRICE_USDC  = '10000' // $0.01 in USDC micro-units (6 decimals)
+const EVM_ADDRESS  = '0x7698672ceE929D3f0fA3c773111b4D6b0095aa1A'
+const SOL_ADDRESS  = 'AP8Q9QaYQ1etKFuUVQdd8RpGCWYH4QLDREfnd76KJX3m'
+const PRICE_USDC   = '10000' // $0.01
+const SEARCH_USDC  = '5000'  // $0.005
 
-const X402_REQUIREMENTS = [
-  { scheme: 'exact', network: 'base',           maxAmountRequired: PRICE_USDC, resource: 'https://airadar.fyi/providers', description: 'AIRadar — AI provider directory', mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',         extra: { name: 'USD Coin', version: '2' } },
-  { scheme: 'exact', network: 'polygon',        maxAmountRequired: PRICE_USDC, resource: 'https://airadar.fyi/providers', description: 'AIRadar — AI provider directory', mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',         extra: { name: 'USD Coin', version: '2' } },
-  { scheme: 'exact', network: 'eip155:42161',   maxAmountRequired: PRICE_USDC, resource: 'https://airadar.fyi/providers', description: 'AIRadar — AI provider directory', mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',         extra: { name: 'USD Coin', version: '2' } },
-  { scheme: 'exact', network: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', maxAmountRequired: PRICE_USDC, resource: 'https://airadar.fyi/providers', description: 'AIRadar — AI provider directory', mimeType: 'application/json', payTo: SOL_ADDRESS, maxTimeoutSeconds: 300, asset: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', extra: {} },
-]
+function makeX402Reqs(amount, resource, description) {
+  return [
+    { scheme: 'exact', network: 'base',           maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',         extra: { name: 'USD Coin', version: '2' } },
+    { scheme: 'exact', network: 'polygon',        maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',         extra: { name: 'USD Coin', version: '2' } },
+    { scheme: 'exact', network: 'eip155:42161',   maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',         extra: { name: 'USD Coin', version: '2' } },
+    { scheme: 'exact', network: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: SOL_ADDRESS, maxTimeoutSeconds: 300, asset: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', extra: {} },
+  ]
+}
+
+const X402_REQUIREMENTS        = makeX402Reqs(PRICE_USDC,  'https://airadar.fyi/providers', 'AIRadar — AI provider directory')
+const SEARCH_X402_REQUIREMENTS = makeX402Reqs(SEARCH_USDC, 'https://airadar.fyi/search',    'AIRadar — web search')
+
+function makeMiddleware(priceSats, priceUsdc, path, label) {
+  const reqs = makeX402Reqs(String(priceUsdc), `https://airadar.fyi${path}`, label)
+  return makeRequirePayment(priceSats, reqs, label)
+}
+
+// Compiled once at startup — shared across all makeRequirePayment instances
+const stmtGetInvoice    = db.prepare('SELECT used_at, amount_sats FROM invoices WHERE payment_hash = ?')
+const stmtMarkUsed      = db.prepare('UPDATE invoices SET used_at = ? WHERE payment_hash = ?')
+const stmtInsertInvoice = db.prepare('INSERT OR IGNORE INTO invoices (payment_hash, bolt11, created_at, amount_sats) VALUES (?, ?, ?, ?)')
+const stmtInsertSettle  = db.prepare('INSERT OR IGNORE INTO invoices (payment_hash, bolt11, created_at, used_at) VALUES (?, ?, ?, ?)')
 
 let nwcClient
 
@@ -29,6 +58,8 @@ export function initServer() {
   nwcClient = new NWCClient({
     nostrWalletConnectUrl: process.env.NWC_SECRET,
   })
+
+  app.use(analyticsMiddleware)
 
   app.get('/info', (_req, res) => {
     res.json({
@@ -96,6 +127,13 @@ export function initServer() {
             },
           ],
         },
+        'GET /search': {
+          description: 'Web search. Returns clean JSON results. No account, no API key.',
+          auth: 'pay-per-use',
+          pricing: { sats: SEARCH_SATS, usdc: '$0.005' },
+          params: { q: 'search query (required)', n: 'number of results (default 5, max 10)' },
+          returns: '{ results: [{ title, url, snippet, engine }], source }',
+        },
         'GET /free': {
           description: 'Free preview: top 3 online providers. No payment required.',
           auth: 'none',
@@ -125,6 +163,16 @@ export function initServer() {
           auth: 'none',
           tools: ['list_providers', 'find_model', 'route', 'compare_prices', 'run_inference'],
         },
+        'GET /reputation/:id': {
+          description: 'Agent reputation score (0-100) based on payment history and behaviour on this network. Free to query — designed for third-party services to verify agent trustworthiness before accepting payments.',
+          auth: 'none',
+          params: { id: 'USDC wallet address or agent_id' },
+          returns: '{ score, label, breakdown, integrate }',
+        },
+        'GET /reputation': {
+          description: 'Leaderboard of top agents by reputation score.',
+          auth: 'none',
+        },
       },
       data_source: {
         protocol: 'Nostr',
@@ -143,12 +191,42 @@ export function initServer() {
     res.json({ status: 'ok', price_sats: PRICE_SATS, price_usdc: '$0.01' })
   })
 
+  const requirePayment       = makeRequirePayment(PRICE_SATS,  X402_REQUIREMENTS,        'AIRadar — provider directory')
+  const requireSearchPayment = makeRequirePayment(SEARCH_SATS, SEARCH_X402_REQUIREMENTS,  'AIRadar — web search')
+  const requireFetch         = makeMiddleware(3,  3000,  '/fetch',  'AIRadar — URL fetch')
+  const requireEmbed         = makeMiddleware(3,  3000,  '/embed',  'AIRadar — embeddings')
+  const requireCompare       = makeMiddleware(20, 20000, '/compare','AIRadar — model compare')
+  const requireMemWrite      = makeMiddleware(2,  2000,  '/memory', 'AIRadar — memory write')
+  const requireMemRead       = makeMiddleware(1,  1000,  '/memory', 'AIRadar — memory read')
+
+  // Price tiers for all new service groups
+  const req1  = makeMiddleware(1,   1000,  '/data',       'AIRadar — data')
+  const req2  = makeMiddleware(2,   2000,  '/data',       'AIRadar — data')
+  const req3  = makeMiddleware(3,   3000,  '/ai',         'AIRadar — AI tools')
+  const req5  = makeMiddleware(5,   5000,  '/ai',         'AIRadar — AI tools')
+  const req8  = makeMiddleware(8,   8000,  '/ai/vision',  'AIRadar — vision')
+  const req50 = makeMiddleware(50,  50000, '/ai/image',   'AIRadar — image generation')
+  const mw    = { req1, req2, req3, req5, req8, req50 }
+
+  app.get('/ping', (_req, res) => res.json({ ok: true }))
+  app.get('/search', requireSearchPayment, handleSearch)
   app.get('/free', getFreeProviders)
   app.get('/providers', requirePayment, getProviders)
   app.get('/providers/best', requirePayment, getBestProvider)
   app.get('/providers/:pubkey', requirePayment, getProviderDetail)
   app.get('/models', requirePayment, getModels)
   app.post('/route', requirePayment, routeRequest)
+  app.get('/fetch',  requireFetch,  handleFetch)
+  app.post('/embed', requireEmbed,  handleEmbed)
+  app.post('/compare', requireCompare, handleCompare)
+  registerMemoryRoutes(app, requireMemWrite, requireMemRead)
+  registerDataRoutes(app, mw)
+  registerAiRoutes(app, mw)
+  registerComputeRoutes(app, mw)
+  registerStateRoutes(app, mw)
+  registerAnalyticsRoutes(app)
+  registerReputationRoutes(app)
+  registerOpenApiRoutes(app)
   registerGatewayRoutes(app, nwcClient)
   registerMcpRoutes(app)
 
@@ -164,92 +242,201 @@ export function initServer() {
   })
 }
 
-async function requirePayment(req, res, next) {
-  // ── 1. Check L402 (Lightning) ──────────────────────────────────────
-  const auth = req.headers.authorization
-  if (auth?.startsWith('L402 ')) {
-    const [paymentHash, preimage] = auth.slice(5).split(':')
-    if (paymentHash && preimage) {
-      const invoice = db.prepare('SELECT used_at FROM invoices WHERE payment_hash = ?').get(paymentHash)
-      if (!invoice) {
-        // Not an invoice we created — reject to prevent use of external hashes
-      } else if (invoice.used_at) {
-        return res.status(402).json({ error: 'Payment already used. Please pay a new invoice.' })
-      } else {
-        try {
-          const lookup = await nwcClient.lookupInvoice({ payment_hash: paymentHash })
-          if (lookup.preimage || lookup.settled_at) {
-            db.prepare('UPDATE invoices SET used_at = ? WHERE payment_hash = ?')
-              .run(Math.floor(Date.now() / 1000), paymentHash)
-            return next()
+function makeRequirePayment(priceSats, x402Reqs, label) {
+  const usdcDisplay = `$${(parseInt(x402Reqs[0].maxAmountRequired) / 1_000_000).toFixed(3)}`
+  const x402Header  = encodePaymentRequiredHeader({ x402Version: 1, accepts: x402Reqs, error: 'Payment required' })
+
+  return async function(req, res, next) {
+    // ── 0. Internal token bypass (MCP server) ─────────────────────────
+    if (req.headers['x-internal-token'] === INTERNAL_TOKEN) {
+      res.locals.paymentType = 'internal'
+      return next()
+    }
+
+    // ── 1. Check L402 (Lightning) ────────────────────────────────────
+    const auth = req.headers.authorization
+    if (auth?.startsWith('L402 ')) {
+      const [paymentHash, preimage] = auth.slice(5).split(':')
+      if (paymentHash && preimage) {
+        const invoice = stmtGetInvoice.get(paymentHash)
+        if (invoice?.used_at) {
+          return res.status(402).json({ error: 'Payment already used. Please pay a new invoice.' })
+        } else if (invoice) {
+          if (invoice.amount_sats !== null && invoice.amount_sats < priceSats) {
+            return res.status(402).json({ error: `Underpayment: this endpoint requires ${priceSats} sats.` })
           }
-        } catch (e) {
-          console.error('L402 lookup failed:', e.message)
+          try {
+            const lookup = await nwcClient.lookupInvoice({ payment_hash: paymentHash })
+            if (lookup.preimage || lookup.settled_at) {
+              stmtMarkUsed.run(Math.floor(Date.now() / 1000), paymentHash)
+              res.locals.paymentType = 'l402'
+              res.locals.paymentId   = paymentHash
+              return next()
+            }
+          } catch (e) {
+            console.error('L402 lookup failed:', e.message)
+          }
         }
       }
     }
-  }
 
-  // ── 2. Check x402 (USDC) ───────────────────────────────────────────
-  const xPayment = req.headers['x-payment']
-  if (xPayment) {
+    // ── 2. Check x402 (USDC) ─────────────────────────────────────────
+    const xPayment = req.headers['x-payment']
+    if (xPayment) {
+      try {
+        const payload = decodePaymentSignatureHeader(xPayment)
+        const matchedReq = x402Reqs.find(r => r.network === payload.network && r.scheme === payload.scheme)
+        if (!matchedReq) throw new Error(`No requirement for scheme=${payload.scheme} network=${payload.network}`)
+        const verifyResult = await facilitator.verify(payload, matchedReq)
+        if (verifyResult.isValid) {
+          const settleId = createHash('sha256').update(xPayment).digest('hex').slice(0, 40)
+          const now = Math.floor(Date.now() / 1000)
+          const dedup = stmtInsertSettle.run(settleId, `x402:${payload.network}`, now, now)
+          if (dedup.changes === 0) throw new Error('x402 payment already processed')
+          await facilitator.settle(payload, matchedReq)
+          res.locals.paymentType   = 'x402'
+          res.locals.paymentId     = settleId
+          res.locals.walletAddress = payload?.payload?.authorization?.from
+                                  || payload?.authorization?.from
+                                  || null
+          return next()
+        }
+      } catch (e) {
+        console.error('x402 verification failed:', e.message)
+      }
+    }
+
+    // ── 3. No valid payment — issue 402 ───────────────────────────────
     try {
-      const payload = decodePaymentSignatureHeader(xPayment)
-      const matchedReq = X402_REQUIREMENTS.find(r => r.network === payload.network && r.scheme === payload.scheme)
-      if (!matchedReq) throw new Error(`No requirement for scheme=${payload.scheme} network=${payload.network}`)
-      const verifyResult = await facilitator.verify(payload, matchedReq)
-      if (verifyResult.isValid) {
-        await facilitator.settle(payload, matchedReq)
-        return next()
+      const invoice = await nwcClient.makeInvoice({
+        amount: priceSats * 1000,
+        description: label,
+      })
+
+      stmtInsertInvoice.run(invoice.payment_hash, invoice.invoice, Math.floor(Date.now() / 1000), priceSats)
+
+      res
+        .status(402)
+        .set('WWW-Authenticate', `L402 macaroon="${invoice.payment_hash}", invoice="${invoice.invoice}"`)
+        .set('X-PAYMENT-REQUIRED', x402Header)
+        .json({
+          error: 'Payment required',
+          payment_options: {
+            lightning: {
+              protocol: 'L402', invoice: invoice.invoice,
+              payment_hash: invoice.payment_hash, amount_sats: priceSats,
+              how_to_pay: `Pay the invoice, then retry with header: Authorization: L402 ${invoice.payment_hash}:<preimage>`,
+            },
+            crypto: {
+              protocol: 'x402', amount_usdc: usdcDisplay,
+              networks: ['Base', 'Polygon', 'Arbitrum', 'Solana'],
+              how_to_pay: 'Sign USDC payment and retry with header: X-PAYMENT: <base64-payload>',
+              payment_required_header: x402Header,
+            },
+          },
+        })
+    } catch (e) {
+      console.error('makeInvoice failed:', e.message)
+      return res.status(500).json({ error: 'Could not generate invoice' })
+    }
+  }
+}
+
+
+async function handleSearch(req, res) {
+  const query = req.query.q?.trim()
+  if (!query) return res.status(400).json({ error: 'Missing ?q= parameter' })
+  const n         = Math.min(parseInt(req.query.n) || 5, 10)
+  const type      = req.query.type === 'news' ? 'news' : 'web'
+  const freshness = req.query.freshness || undefined  // pd=day, pw=week, pm=month, py=year
+  try {
+    const result = await searchWeb(query, n, { type, freshness })
+    res.json({ query, type, count: result.results.length, backend: result.source, results: result.results })
+  } catch (e) {
+    console.error('[search] failed:', e.message)
+    res.status(502).json({ error: 'Search backend unavailable', backend: searchBackend() })
+  }
+}
+
+async function handleFetch(req, res) {
+  const url = req.query.url?.trim()
+  if (!url) return res.status(400).json({ error: 'Missing ?url= parameter' })
+  try {
+    const result = await fetchUrl(url)
+    res.json(result)
+  } catch (e) {
+    console.error('[fetch] failed:', e.message)
+    const status = e.message.startsWith('HTTP ') ? 502 : 400
+    res.status(status).json({ error: e.message })
+  }
+}
+
+async function handleEmbed(req, res) {
+  const { input, model = 'openai/text-embedding-3-small' } = req.body || {}
+  if (!input) return res.status(400).json({ error: 'Missing "input" in request body' })
+  if (!process.env.OPENROUTER_API_KEY) return res.status(503).json({ error: 'Embedding backend not configured' })
+  try {
+    const upstream = await fetch('https://openrouter.ai/api/v1/embeddings', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        'Content-Type':  'application/json',
+        'HTTP-Referer':  'https://airadar.fyi',
+        'X-Title':       'AIRadar Embeddings',
+      },
+      body: JSON.stringify({ model, input }),
+      signal: AbortSignal.timeout(30000),
+    })
+    const data = await upstream.json()
+    if (!upstream.ok) return res.status(upstream.status).json(data)
+    res.json(data)
+  } catch (e) {
+    console.error('[embed] failed:', e.message)
+    res.status(502).json({ error: 'Embedding backend unavailable' })
+  }
+}
+
+async function handleCompare(req, res) {
+  const { prompt, models, system } = req.body || {}
+  if (!prompt) return res.status(400).json({ error: 'Missing "prompt" in request body' })
+  if (!Array.isArray(models) || models.length === 0) return res.status(400).json({ error: 'Missing "models" array in request body' })
+  if (models.length > 5) return res.status(400).json({ error: 'Maximum 5 models per comparison' })
+  if (!process.env.OPENROUTER_API_KEY) return res.status(503).json({ error: 'Compare backend not configured' })
+
+  const messages = system
+    ? [{ role: 'system', content: system }, { role: 'user', content: prompt }]
+    : [{ role: 'user', content: prompt }]
+
+  const callModel = async (modelId) => {
+    const start = Date.now()
+    try {
+      const upstream = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          'Content-Type':  'application/json',
+          'HTTP-Referer':  'https://airadar.fyi',
+          'X-Title':       'AIRadar Compare',
+        },
+        body: JSON.stringify({ model: modelId, messages, max_tokens: 512 }),
+        signal: AbortSignal.timeout(30000),
+      })
+      const data = await upstream.json()
+      if (!upstream.ok) return { model: modelId, error: data.error?.message || `HTTP ${upstream.status}`, latency_ms: Date.now() - start }
+      return {
+        model:        modelId,
+        response:     data.choices?.[0]?.message?.content || '',
+        latency_ms:   Date.now() - start,
+        input_tokens:  data.usage?.prompt_tokens     || null,
+        output_tokens: data.usage?.completion_tokens || null,
       }
     } catch (e) {
-      console.error('x402 verification failed:', e.message)
+      return { model: modelId, error: e.message, latency_ms: Date.now() - start }
     }
   }
 
-  // ── 3. No valid payment — return 402 with both options ─────────────
-  try {
-    const invoice = await nwcClient.makeInvoice({
-      amount: PRICE_SATS * 1000,
-      description: 'AIRadar provider directory',
-    })
-
-    db.prepare('INSERT OR IGNORE INTO invoices (payment_hash, bolt11, created_at) VALUES (?, ?, ?)')
-      .run(invoice.payment_hash, invoice.invoice, Math.floor(Date.now() / 1000))
-
-    const x402Header = encodePaymentRequiredHeader({
-      x402Version: 1,
-      accepts: X402_REQUIREMENTS,
-      error: 'Payment required',
-    })
-
-    res
-      .status(402)
-      .set('WWW-Authenticate', `L402 macaroon="${invoice.payment_hash}", invoice="${invoice.invoice}"`)
-      .set('X-PAYMENT-REQUIRED', x402Header)
-      .json({
-        error: 'Payment required',
-        payment_options: {
-          lightning: {
-            protocol: 'L402',
-            invoice: invoice.invoice,
-            payment_hash: invoice.payment_hash,
-            amount_sats: PRICE_SATS,
-            how_to_pay: `Pay the invoice, then retry with header: Authorization: L402 ${invoice.payment_hash}:<preimage>`,
-          },
-          crypto: {
-            protocol: 'x402',
-            amount_usdc: '$0.01',
-            networks: ['Base', 'Polygon', 'Arbitrum', 'Solana'],
-            how_to_pay: 'Sign USDC payment and retry with header: X-PAYMENT: <base64-payload>',
-            payment_required_header: x402Header,
-          },
-        },
-      })
-  } catch (e) {
-    console.error('makeInvoice failed:', e.message)
-    return res.status(500).json({ error: 'Could not generate invoice' })
-  }
+  const results = await Promise.all(models.map(callModel))
+  res.json({ prompt, system: system || null, results, compared_at: new Date().toISOString() })
 }
 
 function formatProvider(p, models) {

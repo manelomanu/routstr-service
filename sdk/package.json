@@ -1,0 +1,20 @@
+{
+  "name": "@airadar/client",
+  "version": "0.1.0",
+  "description": "AI-native client for AIRadar — automatic L402/x402 payment handling",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".":             "./src/index.js",
+    "./x402-viem":  "./src/x402-viem.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": ["ai", "agents", "l402", "x402", "lightning", "usdc", "airadar"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/manelomanu/airadar-client"
+  }
+}

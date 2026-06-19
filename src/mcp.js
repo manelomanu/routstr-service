@@ -3,18 +3,37 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js'
 import { z } from 'zod'
 import db from './db.js'
 import { INTERNAL_TOKEN } from './gateway.js'
+import { searchWeb } from './search.js'
+import { fetchUrl } from './fetch.js'
+import { getWeather, getCryptoPrices, getStockPrice, getIpInfo, dnsLookup, getWiki, getHnStories, getWhois, getWayback } from './data.js'
+import { hashText, generateUuids, base64Encode, base64Decode, evalMath } from './compute.js'
 
 const GATEWAY_URL = `http://localhost:${process.env.PORT || 3000}`
 
+const stmtProviders = db.prepare(`
+  SELECT p.*, GROUP_CONCAT(m.id) as model_ids
+  FROM providers p
+  LEFT JOIN models m ON m.provider_pubkey = p.pubkey AND m.enabled = 1
+  WHERE p.is_online = 1
+  GROUP BY p.pubkey
+  ORDER BY p.response_ms ASC NULLS LAST
+`)
+
 function getProviders() {
-  return db.prepare(`
-    SELECT p.*, GROUP_CONCAT(m.id) as model_ids
-    FROM providers p
-    LEFT JOIN models m ON m.provider_pubkey = p.pubkey AND m.enabled = 1
-    WHERE p.is_online = 1
-    GROUP BY p.pubkey
-    ORDER BY p.response_ms ASC NULLS LAST
-  `).all()
+  return stmtProviders.all()
+}
+
+async function callAiEndpoint(path, body, { timeout = 30000, pick } = {}) {
+  const res = await fetch(`${GATEWAY_URL}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Internal-Token': INTERNAL_TOKEN },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeout),
+  })
+  const data = await res.json()
+  if (!res.ok) return { content: [{ type: 'text', text: `AI error: ${data.error}` }] }
+  const text = (pick && data[pick] != null) ? String(data[pick]) : JSON.stringify(data, null, 2)
+  return { content: [{ type: 'text', text: text }] }
 }
 
 function getModels({ modelId, modality, maxPriceSats, minContext } = {}) {
@@ -178,6 +197,296 @@ function createMcpServer() {
       const reply = data.choices?.[0]?.message?.content
       if (!reply) return { content: [{ type: 'text', text: JSON.stringify(data) }] }
       return { content: [{ type: 'text', text: reply }] }
+    }
+  )
+
+  // ── Web & data tools ────────────────────────────────────────────────────────
+
+  server.tool(
+    'web_search',
+    'Search the web and get clean JSON results. Use type=news for news articles.',
+    {
+      query:     z.string().describe('Search query'),
+      n:         z.number().int().min(1).max(10).default(5).optional().describe('Number of results'),
+      type:      z.enum(['web', 'news']).default('web').optional(),
+      freshness: z.enum(['pd', 'pw', 'pm', 'py']).optional().describe('pd=day pw=week pm=month py=year'),
+    },
+    async ({ query, n = 5, type = 'web', freshness }) => {
+      try {
+        const result = await searchWeb(query, n, { type, freshness })
+        return { content: [{ type: 'text', text: JSON.stringify({ query, count: result.results.length, results: result.results }, null, 2) }] }
+      } catch (e) {
+        return { content: [{ type: 'text', text: `Search failed: ${e.message}` }] }
+      }
+    }
+  )
+
+  server.tool(
+    'fetch_url',
+    'Fetch and extract clean readable text from any URL. Strips ads, nav, and boilerplate.',
+    { url: z.string().url().describe('URL to fetch') },
+    async ({ url }) => {
+      try {
+        const result = await fetchUrl(url)
+        return { content: [{ type: 'text', text: `# ${result.title}\n\n${result.content}` }] }
+      } catch (e) {
+        return { content: [{ type: 'text', text: `Fetch failed: ${e.message}` }] }
+      }
+    }
+  )
+
+  server.tool(
+    'get_weather',
+    'Get current weather for any city or location.',
+    { location: z.string().describe('City name or address, e.g. "Barcelona" or "New York, NY"') },
+    async ({ location }) => {
+      try {
+        const w = await getWeather(location)
+        return { content: [{ type: 'text', text: JSON.stringify(w, null, 2) }] }
+      } catch (e) {
+        return { content: [{ type: 'text', text: `Weather failed: ${e.message}` }] }
+      }
+    }
+  )
+
+  server.tool(
+    'get_crypto_price',
+    'Get real-time cryptocurrency prices in USD with 24h change. IDs from CoinGecko (bitcoin, ethereum, solana, etc.)',
+    { ids: z.string().describe('Comma-separated coin IDs: bitcoin,ethereum,solana') },
+    async ({ ids }) => {
+      try {
+        const coinIds = ids.split(',').map(s => s.trim()).slice(0, 10)
+        const data = await getCryptoPrices(coinIds)
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] }
+      } catch (e) {
+        return { content: [{ type: 'text', text: `Crypto price failed: ${e.message}` }] }
+      }
+    }
+  )
+
+  server.tool(
+    'get_stock_price',
+    'Get real-time stock, ETF, or crypto price from Yahoo Finance. Examples: AAPL, TSLA, BTC-USD, ETH-USD, SPY',
+    { symbol: z.string().describe('Ticker symbol: AAPL, TSLA, BTC-USD, SPY') },
+    async ({ symbol }) => {
+      try {
+        const data = await getStockPrice(symbol.toUpperCase())
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] }
+      } catch (e) {
+        return { content: [{ type: 'text', text: `Stock lookup failed: ${e.message}` }] }
+      }
+    }
+  )
+
+  server.tool(
+    'get_wikipedia',
+    'Get a Wikipedia article summary for any topic.',
+    { topic: z.string().describe('Topic or article title') },
+    async ({ topic }) => {
+      try {
+        const data = await getWiki(topic)
+        return { content: [{ type: 'text', text: `# ${data.title}\n\n${data.summary}\n\nSource: ${data.url}` }] }
+      } catch (e) {
+        return { content: [{ type: 'text', text: `Wikipedia lookup failed: ${e.message}` }] }
+      }
+    }
+  )
+
+  server.tool(
+    'whois',
+    'Look up domain WHOIS / RDAP info: registrar, nameservers, creation and expiry dates.',
+    { domain: z.string().describe('Domain to look up, e.g. example.com') },
+    async ({ domain }) => {
+      try {
+        const data = await getWhois(domain)
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] }
+      } catch (e) {
+        return { content: [{ type: 'text', text: `WHOIS failed: ${e.message}` }] }
+      }
+    }
+  )
+
+  server.tool(
+    'dns_lookup',
+    'DNS record lookup. Types: A, AAAA, MX, TXT, CNAME, NS, SOA, PTR.',
+    {
+      domain: z.string().describe('Domain to query'),
+      type:   z.enum(['A', 'AAAA', 'MX', 'TXT', 'CNAME', 'NS', 'SOA', 'PTR']).default('A').optional(),
+    },
+    async ({ domain, type = 'A' }) => {
+      try {
+        const data = await dnsLookup(domain, type)
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] }
+      } catch (e) {
+        return { content: [{ type: 'text', text: `DNS lookup failed: ${e.message}` }] }
+      }
+    }
+  )
+
+  server.tool(
+    'ip_info',
+    'Get geolocation and ISP info for an IP address.',
+    { ip: z.string().describe('IPv4 or IPv6 address') },
+    async ({ ip }) => {
+      try {
+        const data = await getIpInfo(ip)
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] }
+      } catch (e) {
+        return { content: [{ type: 'text', text: `IP lookup failed: ${e.message}` }] }
+      }
+    }
+  )
+
+  server.tool(
+    'wayback',
+    'Check if a URL has been archived in the Wayback Machine and get the most recent snapshot.',
+    { url: z.string().url().describe('URL to check') },
+    async ({ url }) => {
+      try {
+        const data = await getWayback(url)
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] }
+      } catch (e) {
+        return { content: [{ type: 'text', text: `Wayback failed: ${e.message}` }] }
+      }
+    }
+  )
+
+  server.tool(
+    'hacker_news',
+    'Get top/new/best stories from Hacker News.',
+    {
+      feed:  z.enum(['top', 'new', 'best', 'ask', 'show']).default('top').optional(),
+      limit: z.number().int().min(1).max(30).default(10).optional(),
+    },
+    async ({ feed = 'top', limit = 10 }) => {
+      try {
+        const stories = await getHnStories(feed, limit)
+        return { content: [{ type: 'text', text: JSON.stringify({ feed, stories }, null, 2) }] }
+      } catch (e) {
+        return { content: [{ type: 'text', text: `HN failed: ${e.message}` }] }
+      }
+    }
+  )
+
+  // ── AI tools ─────────────────────────────────────────────────────────────────
+
+  server.tool(
+    'ai_summarize',
+    'Summarize a text using AI. Returns a concise summary.',
+    {
+      text:   z.string().describe('Text to summarize'),
+      length: z.enum(['short', 'medium', 'long']).default('medium').optional().describe('short=1-2 sentences, medium=3-5 sentences, long=paragraph'),
+    },
+    async ({ text, length = 'medium' }) => {
+      try { return await callAiEndpoint('/ai/summarize', { text, length }, { pick: 'summary' }) }
+      catch (e) { return { content: [{ type: 'text', text: `Summarize failed: ${e.message}` }] } }
+    }
+  )
+
+  server.tool(
+    'ai_translate',
+    'Translate text to a target language using AI.',
+    {
+      text: z.string().describe('Text to translate'),
+      to:   z.string().describe('Target language, e.g. Spanish, French, Japanese, Arabic'),
+      from: z.string().optional().describe('Source language (auto-detected if omitted)'),
+    },
+    async ({ text, to, from }) => {
+      try { return await callAiEndpoint('/ai/translate', { text, to, from }, { pick: 'translation' }) }
+      catch (e) { return { content: [{ type: 'text', text: `Translate failed: ${e.message}` }] } }
+    }
+  )
+
+  server.tool(
+    'ai_sentiment',
+    'Analyze the sentiment of text: positive, negative, or neutral with a confidence score.',
+    { text: z.string().describe('Text to analyze') },
+    async ({ text }) => {
+      try { return await callAiEndpoint('/ai/sentiment', { text }, { timeout: 20000 }) }
+      catch (e) { return { content: [{ type: 'text', text: `Sentiment failed: ${e.message}` }] } }
+    }
+  )
+
+  server.tool(
+    'ai_extract',
+    'Extract structured data from text according to a schema. Schema maps field names to descriptions.',
+    {
+      text:   z.string().describe('Source text'),
+      schema: z.record(z.string()).describe('Schema: { "field": "description of what to extract" }'),
+    },
+    async ({ text, schema }) => {
+      try { return await callAiEndpoint('/ai/extract', { text, schema }) }
+      catch (e) { return { content: [{ type: 'text', text: `Extract failed: ${e.message}` }] } }
+    }
+  )
+
+  server.tool(
+    'ai_vision',
+    'Describe an image or answer a question about it. Pass a publicly accessible image URL.',
+    {
+      image_url: z.string().url().describe('URL of the image to analyze'),
+      question:  z.string().optional().describe('Question about the image (default: describe it)'),
+    },
+    async ({ image_url, question }) => {
+      try { return await callAiEndpoint('/ai/vision', { image_url, question: question || 'Describe this image in detail.' }, { pick: 'answer' }) }
+      catch (e) { return { content: [{ type: 'text', text: `Vision failed: ${e.message}` }] } }
+    }
+  )
+
+  // ── Compute tools ────────────────────────────────────────────────────────────
+
+  server.tool(
+    'hash_text',
+    'Hash a string with md5, sha1, sha256, or sha512.',
+    {
+      text: z.string().describe('Text to hash'),
+      algo: z.enum(['md5', 'sha1', 'sha256', 'sha512']).default('sha256').optional(),
+    },
+    async ({ text, algo = 'sha256' }) => {
+      try {
+        return { content: [{ type: 'text', text: JSON.stringify(hashText(text, algo), null, 2) }] }
+      } catch (e) {
+        return { content: [{ type: 'text', text: `Hash failed: ${e.message}` }] }
+      }
+    }
+  )
+
+  server.tool(
+    'generate_uuid',
+    'Generate one or more UUID v4 values.',
+    { n: z.number().int().min(1).max(100).default(1).optional().describe('How many UUIDs to generate') },
+    async ({ n = 1 }) => {
+      return { content: [{ type: 'text', text: JSON.stringify(generateUuids(n), null, 2) }] }
+    }
+  )
+
+  server.tool(
+    'base64',
+    'Encode or decode a string with base64.',
+    {
+      data:   z.string().describe('Data to encode or decode'),
+      action: z.enum(['encode', 'decode']).default('encode').optional(),
+    },
+    async ({ data, action = 'encode' }) => {
+      try {
+        const result = action === 'decode' ? base64Decode(data) : base64Encode(data)
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+      } catch (e) {
+        return { content: [{ type: 'text', text: `Base64 failed: ${e.message}` }] }
+      }
+    }
+  )
+
+  server.tool(
+    'math_eval',
+    'Evaluate a math expression safely. Supports all Math.* functions: Math.sqrt(2), Math.PI, Math.pow(2,10), etc.',
+    { expr: z.string().describe('Math expression to evaluate, e.g. "Math.sqrt(2) * 100"') },
+    async ({ expr }) => {
+      try {
+        return { content: [{ type: 'text', text: JSON.stringify(evalMath(expr), null, 2) }] }
+      } catch (e) {
+        return { content: [{ type: 'text', text: `Math eval failed: ${e.message}` }] }
+      }
     }
   )
 

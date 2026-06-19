@@ -70,6 +70,66 @@ db.exec(`
     used_at      INTEGER,
     amount_sats  INTEGER
   );
+
+  CREATE TABLE IF NOT EXISTS memory (
+    agent_id   TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT,
+    updated_at INTEGER,
+    PRIMARY KEY (agent_id, key)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_memory_agent ON memory(agent_id);
+
+  CREATE TABLE IF NOT EXISTS request_log (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             INTEGER NOT NULL,
+    endpoint       TEXT    NOT NULL,
+    method         TEXT    DEFAULT 'GET',
+    status         INTEGER,
+    response_ms    INTEGER,
+    payment_type   TEXT,
+    payment_id     TEXT,
+    wallet_address TEXT,
+    agent_id       TEXT,
+    model          TEXT,
+    ip_hash        TEXT,
+    user_agent     TEXT,
+    query_text     TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_rl_ts         ON request_log(ts DESC);
+  CREATE INDEX IF NOT EXISTS idx_rl_wallet     ON request_log(wallet_address) WHERE wallet_address IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_rl_endpoint   ON request_log(endpoint);
+  CREATE INDEX IF NOT EXISTS idx_rl_ip         ON request_log(ip_hash);
+
+  CREATE TABLE IF NOT EXISTS counters (
+    agent_id   TEXT    NOT NULL,
+    name       TEXT    NOT NULL,
+    value      INTEGER DEFAULT 0,
+    updated_at INTEGER,
+    PRIMARY KEY (agent_id, name)
+  );
+
+  CREATE TABLE IF NOT EXISTS agent_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id   TEXT    NOT NULL,
+    event      TEXT    NOT NULL,
+    data       TEXT,
+    created_at INTEGER
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_agent_log ON agent_log(agent_id, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS job_queue (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    type         TEXT    NOT NULL,
+    payload      TEXT,
+    status       TEXT    DEFAULT 'pending',
+    result       TEXT,
+    created_at   INTEGER,
+    completed_at INTEGER
+  );
 `)
 
 // Migrations: add new columns if they don't exist

@@ -1,0 +1,9 @@
+{
+  "name": "@airadar/airadar",
+  "version": "0.1.2",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "exclude": ["src/x402-viem.js", "test.mjs"]
+}
