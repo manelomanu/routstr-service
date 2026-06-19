@@ -64,7 +64,9 @@ export function initServer() {
 
   app.use(analyticsMiddleware)
 
-  app.get('/info', (_req, res) => {
+  const requireInfo = makeMiddleware(1, 1000, '/info', 'AIRadar — service info')
+
+  app.get('/info', requireInfo, (_req, res) => {
     res.json({
       name: 'AIRadar — AI Provider Directory',
       url: 'https://airadar.fyi',
