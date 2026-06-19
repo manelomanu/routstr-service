@@ -130,6 +130,13 @@ db.exec(`
     created_at   INTEGER,
     completed_at INTEGER
   );
+
+  CREATE TABLE IF NOT EXISTS iota_txs (
+    tx_hash      TEXT PRIMARY KEY,
+    from_address TEXT,
+    amount_base  TEXT,
+    used_at      INTEGER NOT NULL
+  );
 `)
 
 // Migrations: add new columns if they don't exist

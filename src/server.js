@@ -15,6 +15,7 @@ import { registerStateRoutes } from './state.js'
 import { analyticsMiddleware, registerAnalyticsRoutes } from './analytics.js'
 import { registerReputationRoutes } from './reputation.js'
 import { registerOpenApiRoutes } from './openapi.js'
+import { getIotaUsdPrice, usdToIotaBase, iotaBaseToDisplay, verifyIotaPayment } from './iota-pay.js'
 
 const app = express()
 const jsonMiddleware = express.json()
@@ -51,6 +52,8 @@ const stmtGetInvoice    = db.prepare('SELECT used_at, amount_sats FROM invoices 
 const stmtMarkUsed      = db.prepare('UPDATE invoices SET used_at = ? WHERE payment_hash = ?')
 const stmtInsertInvoice = db.prepare('INSERT OR IGNORE INTO invoices (payment_hash, bolt11, created_at, amount_sats) VALUES (?, ?, ?, ?)')
 const stmtInsertSettle  = db.prepare('INSERT OR IGNORE INTO invoices (payment_hash, bolt11, created_at, used_at) VALUES (?, ?, ?, ?)')
+const stmtGetIotaTx     = db.prepare('SELECT tx_hash FROM iota_txs WHERE tx_hash = ?')
+const stmtInsertIotaTx  = db.prepare('INSERT OR IGNORE INTO iota_txs (tx_hash, from_address, amount_base, used_at) VALUES (?, ?, ?, ?)')
 
 let nwcClient
 
@@ -243,7 +246,8 @@ export function initServer() {
 }
 
 function makeRequirePayment(priceSats, x402Reqs, label) {
-  const usdcDisplay = `$${(parseInt(x402Reqs[0].maxAmountRequired) / 1_000_000).toFixed(3)}`
+  const priceUsd    = parseInt(x402Reqs[0].maxAmountRequired) / 1_000_000
+  const usdcDisplay = `$${priceUsd.toFixed(3)}`
   const x402Header  = encodePaymentRequiredHeader({ x402Version: 1, accepts: x402Reqs, error: 'Payment required' })
 
   return async function(req, res, next) {
@@ -306,7 +310,28 @@ function makeRequirePayment(priceSats, x402Reqs, label) {
       }
     }
 
-    // ── 3. No valid payment — issue 402 ───────────────────────────────
+    // ── 3. Check IOTA (native token on IOTA EVM, chain 8822) ──────────
+    const iotaTxHeader = req.headers['x-iota-tx']
+    if (iotaTxHeader && /^0x[0-9a-fA-F]{64}$/.test(iotaTxHeader)) {
+      try {
+        if (stmtGetIotaTx.get(iotaTxHeader)) {
+          return res.status(402).json({ error: 'IOTA transaction already used.' })
+        }
+        const iotaUsd  = await getIotaUsdPrice()
+        const minBase  = usdToIotaBase(priceUsd, iotaUsd) * 75n / 100n  // 25% tolerance for price swings
+        const verified = await verifyIotaPayment(iotaTxHeader, minBase, EVM_ADDRESS)
+        stmtInsertIotaTx.run(iotaTxHeader, verified.from, verified.value, Math.floor(Date.now() / 1000))
+        res.locals.paymentType   = 'iota'
+        res.locals.paymentId     = iotaTxHeader
+        res.locals.walletAddress = verified.from
+        return next()
+      } catch (e) {
+        console.error('[iota] payment failed:', e.message)
+        return res.status(402).json({ error: `IOTA payment invalid: ${e.message}` })
+      }
+    }
+
+    // ── 4. No valid payment — issue 402 ───────────────────────────────
     try {
       const invoice = await nwcClient.makeInvoice({
         amount: priceSats * 1000,
@@ -314,6 +339,23 @@ function makeRequirePayment(priceSats, x402Reqs, label) {
       })
 
       stmtInsertInvoice.run(invoice.payment_hash, invoice.invoice, Math.floor(Date.now() / 1000), priceSats)
+
+      // Build IOTA payment option (best-effort; omit if price unavailable)
+      let iotaOption = null
+      try {
+        const iotaUsd   = await getIotaUsdPrice()
+        const baseUnits = usdToIotaBase(priceUsd, iotaUsd)
+        iotaOption = {
+          protocol:          'iota-native',
+          token:             'IOTA',
+          chain_id:          8822,
+          chain_name:        'IOTA EVM Mainnet',
+          to:                EVM_ADDRESS,
+          amount_iota:       iotaBaseToDisplay(baseUnits),
+          amount_base_units: baseUnits.toString(),
+          how_to_pay:        `Send ${iotaBaseToDisplay(baseUnits)} IOTA to ${EVM_ADDRESS} on IOTA EVM (chain 8822), then retry with header: X-Iota-Tx: <txhash>`,
+        }
+      } catch { /* price fetch failed — omit IOTA option */ }
 
       res
         .status(402)
@@ -327,12 +369,13 @@ function makeRequirePayment(priceSats, x402Reqs, label) {
               payment_hash: invoice.payment_hash, amount_sats: priceSats,
               how_to_pay: `Pay the invoice, then retry with header: Authorization: L402 ${invoice.payment_hash}:<preimage>`,
             },
-            crypto: {
+            usdc: {
               protocol: 'x402', amount_usdc: usdcDisplay,
               networks: ['Base', 'Polygon', 'Arbitrum', 'Solana'],
               how_to_pay: 'Sign USDC payment and retry with header: X-PAYMENT: <base64-payload>',
               payment_required_header: x402Header,
             },
+            ...(iotaOption && { iota: iotaOption }),
           },
         })
     } catch (e) {
