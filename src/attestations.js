@@ -86,11 +86,20 @@ function buildAttestation(provider, sk) {
   }, sk)
 }
 
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
+  ])
+}
+
 async function publishToRelay(relayUrl, event) {
   try {
-    const relay = await Relay.connect(relayUrl)
-    await relay.publish(event)
-    relay.close()
+    await withTimeout((async () => {
+      const relay = await Relay.connect(relayUrl)
+      await relay.publish(event)
+      relay.close()
+    })(), 8000)
     return true
   } catch {
     return false
