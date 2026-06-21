@@ -4,12 +4,11 @@ export class AIRadarClient {
    * @param {string}   [opts.baseUrl='https://airadar.fyi']
    * @param {function} [opts.lightning]  async (bolt11: string) => preimage: string
    * @param {function} [opts.x402]       async (requirements: object) => base64Payload: string
-   * @param {function} [opts.iota]       async (info: {to,amount_iota,amount_base_units,chain_id}) => txHash: string
-   * @param {'lightning'|'x402'|'iota'} [opts.prefer='lightning']  which payment method to try first
+   * @param {'lightning'|'x402'} [opts.prefer='lightning']  which payment method to try first
    */
-  constructor({ baseUrl = 'https://airadar.fyi', lightning, x402, iota, prefer = 'lightning' } = {}) {
+  constructor({ baseUrl = 'https://airadar.fyi', lightning, x402, prefer = 'lightning' } = {}) {
     this.base   = baseUrl.replace(/\/$/, '')
-    this._pay   = { lightning, x402, iota }
+    this._pay   = { lightning, x402 }
     this.prefer = prefer
   }
 
@@ -56,19 +55,16 @@ export class AIRadarClient {
 
     const tryL402 = this._pay.lightning && opts.lightning
     const tryX402 = this._pay.x402     && opts.usdc
-    const tryIota = this._pay.iota      && opts.iota
 
-    const order = this.prefer === 'x402'  ? [tryX402 && 'x402',  tryL402 && 'l402', tryIota && 'iota']
-                : this.prefer === 'iota'  ? [tryIota && 'iota',  tryL402 && 'l402', tryX402 && 'x402']
-                :                          [tryL402 && 'l402',  tryX402 && 'x402', tryIota && 'iota']
+    const order = this.prefer === 'x402' ? [tryX402 && 'x402', tryL402 && 'l402']
+                :                          [tryL402 && 'l402',  tryX402 && 'x402']
 
     for (const method of order) {
       if (method === 'l402') return this._payL402(opts.lightning)
       if (method === 'x402') return this._payX402(opts.usdc)
-      if (method === 'iota') return this._payIota(opts.iota)
     }
 
-    const e = new Error('Payment required — configure a lightning, x402, or iota handler')
+    const e = new Error('Payment required — configure a lightning or x402 handler')
     e.status = 402
     e.payment_options = opts
     throw e
@@ -83,11 +79,6 @@ export class AIRadarClient {
     const requirements = JSON.parse(atob(payment_required_header))
     const payload = await this._pay.x402(requirements)
     return { 'X-PAYMENT': payload }
-  }
-
-  async _payIota(info) {
-    const txHash = await this._pay.iota(info)
-    return { 'X-Iota-Tx': txHash }
   }
 
   get  = (path, opts) => this.request('GET',    path, opts)

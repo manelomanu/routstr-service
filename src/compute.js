@@ -1,8 +1,10 @@
 import { createHash, randomUUID } from 'crypto'
+import vm from 'vm'
 import { encode } from 'gpt-tokenizer'
 import QRCode from 'qrcode'
 import tls from 'tls'
 import net from 'net'
+import { assertPublicHost } from './net-guard.js'
 
 // ── Token counter ─────────────────────────────────────────────────────────────
 export function countTokens(text) {
@@ -18,17 +20,19 @@ export async function makeQr(data, size = 300) {
 
 // ── Safe math eval ────────────────────────────────────────────────────────────
 const MATH_RE = /^[\d\s+\-*/.^%(),a-zA-Z]+$/
+// Isolated VM context: only Math is available — no process, require, globalThis, etc.
+const MATH_CONTEXT = vm.createContext({ Math })
 
 export function evalMath(expr) {
   if (!MATH_RE.test(expr)) throw new Error('Expression contains invalid characters')
-  // eslint-disable-next-line no-new-func
-  const result = new Function('Math', `"use strict"; return (${expr})`)(Math)
+  const result = vm.runInContext(`"use strict";(${expr})`, MATH_CONTEXT, { timeout: 100 })
   if (typeof result !== 'number' || !isFinite(result)) throw new Error('Expression produced a non-finite result')
   return { expression: expr, result }
 }
 
 // ── SSL cert info ─────────────────────────────────────────────────────────────
-export function getSslInfo(hostname) {
+export async function getSslInfo(hostname) {
+  await assertPublicHost(hostname)
   return new Promise((resolve, reject) => {
     const socket = tls.connect(443, hostname, { servername: hostname }, () => {
       const cert = socket.getPeerCertificate()
@@ -50,7 +54,8 @@ export function getSslInfo(hostname) {
 }
 
 // ── Port check ────────────────────────────────────────────────────────────────
-export function checkPort(host, port) {
+export async function checkPort(host, port) {
+  await assertPublicHost(host)
   return new Promise((resolve) => {
     const socket = new net.Socket()
     let open = false

@@ -2,6 +2,7 @@ import { createHash } from 'crypto'
 import express from 'express'
 import { NWCClient } from '@getalby/sdk'
 import { facilitator, decodePaymentSignatureHeader, encodePaymentRequiredHeader } from './x402.js'
+import { verifyCashu, cashuPaymentInfo, TRUSTED_MINTS } from './cashu.js'
 import db from './db.js'
 import { registerMcpRoutes, setJsonMiddleware } from './mcp.js'
 import { registerGatewayRoutes, INTERNAL_TOKEN } from './gateway.js'
@@ -13,12 +14,16 @@ import { registerAiRoutes } from './ai-tools.js'
 import { registerComputeRoutes } from './compute.js'
 import { registerStateRoutes } from './state.js'
 import { analyticsMiddleware, registerAnalyticsRoutes } from './analytics.js'
-import { registerReputationRoutes } from './reputation.js'
+import { registerReputationRoutes, startOtsAnchor } from './reputation.js'
+import { startAttestationPublisher } from './attestations.js'
+import { registerIntelligenceRoutes } from './intelligence.js'
+import { registerMarketplaceRoutes } from './marketplace.js'
+import { registerMonitorRoutes, startMonitor } from './monitoring.js'
+import { registerChainAnalysisRoutes } from './agentanalysis.js'
 import { registerOpenApiRoutes } from './openapi.js'
-import { getIotaUsdPrice, usdToIotaBase, iotaBaseToDisplay, verifyIotaPayment } from './iota-pay.js'
 
 const app = express()
-const jsonMiddleware = express.json()
+const jsonMiddleware = express.json({ limit: '1mb' })
 app.use(jsonMiddleware)
 setJsonMiddleware(jsonMiddleware)
 const PRICE_SATS  = parseInt(process.env.PRICE_SATS || '10')
@@ -36,11 +41,10 @@ function makeX402Reqs(amount, resource, description) {
     { scheme: 'exact', network: 'polygon',        maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',         extra: { name: 'USD Coin', version: '2' } },
     { scheme: 'exact', network: 'eip155:42161',   maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',         extra: { name: 'USD Coin', version: '2' } },
     { scheme: 'exact', network: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: SOL_ADDRESS, maxTimeoutSeconds: 300, asset: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', extra: {} },
+    { scheme: 'exact', network: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: SOL_ADDRESS, maxTimeoutSeconds: 300, asset: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', extra: {} },
   ]
 }
 
-const X402_REQUIREMENTS        = makeX402Reqs(PRICE_USDC,  'https://airadar.fyi/providers', 'AIRadar — AI provider directory')
-const SEARCH_X402_REQUIREMENTS = makeX402Reqs(SEARCH_USDC, 'https://airadar.fyi/search',    'AIRadar — web search')
 
 function makeMiddleware(priceSats, priceUsdc, path, label) {
   const reqs = makeX402Reqs(String(priceUsdc), `https://airadar.fyi${path}`, label)
@@ -49,11 +53,10 @@ function makeMiddleware(priceSats, priceUsdc, path, label) {
 
 // Compiled once at startup — shared across all makeRequirePayment instances
 const stmtGetInvoice    = db.prepare('SELECT used_at, amount_sats FROM invoices WHERE payment_hash = ?')
-const stmtMarkUsed      = db.prepare('UPDATE invoices SET used_at = ? WHERE payment_hash = ?')
+const stmtMarkUsed      = db.prepare('UPDATE invoices SET used_at = ? WHERE payment_hash = ? AND used_at IS NULL')
 const stmtInsertInvoice = db.prepare('INSERT OR IGNORE INTO invoices (payment_hash, bolt11, created_at, amount_sats) VALUES (?, ?, ?, ?)')
 const stmtInsertSettle  = db.prepare('INSERT OR IGNORE INTO invoices (payment_hash, bolt11, created_at, used_at) VALUES (?, ?, ?, ?)')
-const stmtGetIotaTx     = db.prepare('SELECT tx_hash FROM iota_txs WHERE tx_hash = ?')
-const stmtInsertIotaTx  = db.prepare('INSERT OR IGNORE INTO iota_txs (tx_hash, from_address, amount_base, used_at) VALUES (?, ?, ?, ?)')
+const stmtDeleteSettle  = db.prepare('DELETE FROM invoices WHERE payment_hash = ?')
 
 let nwcClient
 
@@ -183,7 +186,7 @@ export function initServer() {
         protocol: 'Nostr',
         event_kind: 38421,
         description: 'Routstr Provider Announcements (NIP-91)',
-        relays: ['wss://relay.routstr.com', 'wss://relay.nostr.band', 'wss://relay.damus.io', 'wss://nos.lol'],
+        relays: ['wss://relay.airadar.fyi', 'wss://relay.routstr.com', 'wss://relay.nostr.band', 'wss://relay.damus.io', 'wss://nos.lol'],
       },
       payment_protocols: [
         'L402 — https://docs.lightning.engineering/the-lightning-network/l402',
@@ -196,11 +199,43 @@ export function initServer() {
     res.json({ status: 'ok', price_sats: PRICE_SATS, price_usdc: '$0.01' })
   })
 
-  const requirePayment       = makeRequirePayment(PRICE_SATS,  X402_REQUIREMENTS,        'AIRadar — provider directory')
-  const requireSearchPayment = makeRequirePayment(SEARCH_SATS, SEARCH_X402_REQUIREMENTS,  'AIRadar — web search')
+  app.get('/pay', async (_req, res) => {
+    try {
+      const invoice = await nwcClient.makeInvoice({ amount: 10_000, description: 'AIRadar /intelligence — 10 sats' })
+      db.prepare('INSERT OR IGNORE INTO invoices (payment_hash, bolt11, created_at, amount_sats) VALUES (?, ?, ?, ?)')
+        .run(invoice.payment_hash, invoice.invoice, Math.floor(Date.now() / 1000), 10)
+      const inv = invoice.invoice.toUpperCase()
+      res.setHeader('Content-Type', 'text/html')
+      res.send(`<!DOCTYPE html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>
+<title>Pay 10 sats — AIRadar</title>
+<script src='https://cdn.jsdelivr.net/npm/qrcodejs/qrcode.min.js'></script>
+<style>body{background:#111;color:#fff;font-family:monospace;display:flex;flex-direction:column;align-items:center;padding:30px;gap:12px}
+h2{margin:0}#qr canvas,#qr img{border:10px solid #fff;border-radius:4px}
+code{word-break:break-all;max-width:520px;font-size:9px;color:#666;text-align:center;display:block}
+a{color:#facc15;font-size:14px}small{color:#888;font-size:11px}</style></head>
+<body><h2>⚡ 10 sats — AIRadar /intelligence</h2>
+<div id='qr'></div>
+<a href='lightning:${invoice.invoice}'>Abrir en wallet ↗</a>
+<small>Hash: ${invoice.payment_hash}</small>
+<code>${invoice.invoice}</code>
+<script>new QRCode(document.getElementById('qr'),{text:'lightning:${inv}',width:300,height:300,colorDark:'#000',colorLight:'#fff'})</script>
+</body></html>`)
+    } catch (e) {
+      res.status(500).send('Error generating invoice: ' + e.message)
+    }
+  })
+
+  const requirePayment       = makeMiddleware(PRICE_SATS,  parseInt(PRICE_USDC),  '/providers', 'AIRadar — provider directory')
+  const requireSearchPayment = makeMiddleware(SEARCH_SATS, parseInt(SEARCH_USDC), '/search',    'AIRadar — web search')
   const requireFetch         = makeMiddleware(3,  3000,  '/fetch',  'AIRadar — URL fetch')
   const requireEmbed         = makeMiddleware(3,  3000,  '/embed',  'AIRadar — embeddings')
-  const requireCompare       = makeMiddleware(20, 20000, '/compare','AIRadar — model compare')
+  const requireCompare       = makeMiddleware(20,  20000, '/compare',              'AIRadar — model compare')
+  const requireIntelligence  = makeMiddleware(10,  10000, '/intelligence',         'AIRadar — network intelligence')
+  const requireRepDetail     = makeMiddleware(5,   5000,  '/reputation/detail',    'AIRadar — reputation detail')
+  const requireMarketList    = makeMiddleware(50,  50000, '/marketplace',          'AIRadar — agent listing (30 days)')
+  const requireMarketReveal  = makeMiddleware(5,   5000,  '/marketplace/reveal',   'AIRadar — agent reveal')
+  const requireMonitorSub    = makeMiddleware(10,  10000, '/monitor/subscribe',    'AIRadar — provider monitoring (30 days)')
+  const requireChainAnalysis = makeMiddleware(15,  15000, '/agentanalysis',         'AIRadar — agent analysis')
   const requireMemWrite      = makeMiddleware(2,  2000,  '/memory', 'AIRadar — memory write')
   const requireMemRead       = makeMiddleware(1,  1000,  '/memory', 'AIRadar — memory read')
 
@@ -230,10 +265,18 @@ export function initServer() {
   registerComputeRoutes(app, mw)
   registerStateRoutes(app, mw)
   registerAnalyticsRoutes(app)
-  registerReputationRoutes(app)
+  registerReputationRoutes(app, requireRepDetail)
+  registerIntelligenceRoutes(app, requireIntelligence)
+  registerMarketplaceRoutes(app, requireMarketList, requireMarketReveal)
+  registerMonitorRoutes(app, requireMonitorSub)
+  registerChainAnalysisRoutes(app, requireChainAnalysis)
   registerOpenApiRoutes(app)
   registerGatewayRoutes(app, nwcClient)
   registerMcpRoutes(app)
+
+  startOtsAnchor()
+  startMonitor()
+  startAttestationPublisher()
 
   // Clean up unpaid invoices older than 24 hours
   setInterval(() => {
@@ -268,13 +311,16 @@ function makeRequirePayment(priceSats, x402Reqs, label) {
         if (invoice?.used_at) {
           return res.status(402).json({ error: 'Payment already used. Please pay a new invoice.' })
         } else if (invoice) {
-          if (invoice.amount_sats !== null && invoice.amount_sats < priceSats) {
+          if (!invoice.amount_sats || invoice.amount_sats < priceSats) {
             return res.status(402).json({ error: `Underpayment: this endpoint requires ${priceSats} sats.` })
           }
           try {
             const lookup = await nwcClient.lookupInvoice({ payment_hash: paymentHash })
             if (lookup.preimage || lookup.settled_at) {
-              stmtMarkUsed.run(Math.floor(Date.now() / 1000), paymentHash)
+              const mark = stmtMarkUsed.run(Math.floor(Date.now() / 1000), paymentHash)
+              if (mark.changes === 0) {
+                return res.status(402).json({ error: 'Payment already used. Please pay a new invoice.' })
+              }
               res.locals.paymentType = 'l402'
               res.locals.paymentId   = paymentHash
               return next()
@@ -286,20 +332,29 @@ function makeRequirePayment(priceSats, x402Reqs, label) {
       }
     }
 
-    // ── 2. Check x402 (USDC) ─────────────────────────────────────────
+    // ── 2. Check x402 (USDC / USDT Solana / …) ──────────────────────
     const xPayment = req.headers['x-payment']
     if (xPayment) {
       try {
         const payload = decodePaymentSignatureHeader(xPayment)
-        const matchedReq = x402Reqs.find(r => r.network === payload.network && r.scheme === payload.scheme)
-        if (!matchedReq) throw new Error(`No requirement for scheme=${payload.scheme} network=${payload.network}`)
-        const verifyResult = await facilitator.verify(payload, matchedReq)
-        if (verifyResult.isValid) {
-          const settleId = createHash('sha256').update(xPayment).digest('hex').slice(0, 40)
+        const candidates = x402Reqs.filter(r => r.network === payload.network && r.scheme === payload.scheme)
+        if (!candidates.length) throw new Error(`No requirement for scheme=${payload.scheme} network=${payload.network}`)
+        let matchedReq, verifyResult
+        for (const candidate of candidates) {
+          verifyResult = await facilitator.verify(payload, candidate)
+          if (verifyResult.isValid) { matchedReq = candidate; break }
+        }
+        if (matchedReq) {
+          const settleId = createHash('sha256').update(xPayment).digest('hex')
           const now = Math.floor(Date.now() / 1000)
           const dedup = stmtInsertSettle.run(settleId, `x402:${payload.network}`, now, now)
           if (dedup.changes === 0) throw new Error('x402 payment already processed')
-          await facilitator.settle(payload, matchedReq)
+          try {
+            await facilitator.settle(payload, matchedReq)
+          } catch (settleErr) {
+            stmtDeleteSettle.run(settleId)
+            throw settleErr
+          }
           res.locals.paymentType   = 'x402'
           res.locals.paymentId     = settleId
           res.locals.walletAddress = payload?.payload?.authorization?.from
@@ -312,28 +367,21 @@ function makeRequirePayment(priceSats, x402Reqs, label) {
       }
     }
 
-    // ── 3. Check IOTA (native token on IOTA EVM, chain 8822) ──────────
-    const iotaTxHeader = req.headers['x-iota-tx']
-    if (iotaTxHeader && /^0x[0-9a-fA-F]{64}$/.test(iotaTxHeader)) {
+    // ── 3. Check Cashu ecash ─────────────────────────────────────────
+    const xCashu = req.headers['x-cashu']
+    if (xCashu && TRUSTED_MINTS.size > 0) {
       try {
-        if (stmtGetIotaTx.get(iotaTxHeader)) {
-          return res.status(402).json({ error: 'IOTA transaction already used.' })
-        }
-        const iotaUsd  = await getIotaUsdPrice()
-        const minBase  = usdToIotaBase(priceUsd, iotaUsd) * 75n / 100n  // 25% tolerance for price swings
-        const verified = await verifyIotaPayment(iotaTxHeader, minBase, EVM_ADDRESS)
-        stmtInsertIotaTx.run(iotaTxHeader, verified.from, verified.value, Math.floor(Date.now() / 1000))
-        res.locals.paymentType   = 'iota'
-        res.locals.paymentId     = iotaTxHeader
-        res.locals.walletAddress = verified.from
+        const result = await verifyCashu(xCashu, priceSats, nwcClient)
+        res.locals.paymentType = 'cashu'
+        res.locals.paymentId   = result.preimage
+        res.locals.mintUrl     = result.mintUrl
         return next()
       } catch (e) {
-        console.error('[iota] payment failed:', e.message)
-        return res.status(402).json({ error: `IOTA payment invalid: ${e.message}` })
+        console.error('Cashu verification failed:', e.message)
       }
     }
 
-    // ── 4. No valid payment — issue 402 ───────────────────────────────
+    // ── 4. No valid payment — issue 402 ──────────────────────────────
     try {
       const invoice = await nwcClient.makeInvoice({
         amount: priceSats * 1000,
@@ -341,23 +389,6 @@ function makeRequirePayment(priceSats, x402Reqs, label) {
       })
 
       stmtInsertInvoice.run(invoice.payment_hash, invoice.invoice, Math.floor(Date.now() / 1000), priceSats)
-
-      // Build IOTA payment option (best-effort; omit if price unavailable)
-      let iotaOption = null
-      try {
-        const iotaUsd   = await getIotaUsdPrice()
-        const baseUnits = usdToIotaBase(priceUsd, iotaUsd)
-        iotaOption = {
-          protocol:          'iota-native',
-          token:             'IOTA',
-          chain_id:          8822,
-          chain_name:        'IOTA EVM Mainnet',
-          to:                EVM_ADDRESS,
-          amount_iota:       iotaBaseToDisplay(baseUnits),
-          amount_base_units: baseUnits.toString(),
-          how_to_pay:        `Send ${iotaBaseToDisplay(baseUnits)} IOTA to ${EVM_ADDRESS} on IOTA EVM (chain 8822), then retry with header: X-Iota-Tx: <txhash>`,
-        }
-      } catch { /* price fetch failed — omit IOTA option */ }
 
       res
         .status(402)
@@ -377,7 +408,9 @@ function makeRequirePayment(priceSats, x402Reqs, label) {
               how_to_pay: 'Sign USDC payment and retry with header: X-PAYMENT: <base64-payload>',
               payment_required_header: x402Header,
             },
-            ...(iotaOption && { iota: iotaOption }),
+            ...(TRUSTED_MINTS.size > 0 && {
+              cashu: cashuPaymentInfo(TRUSTED_MINTS, priceSats),
+            }),
           },
         })
     } catch (e) {
@@ -687,7 +720,7 @@ function getBestProvider(req, res) {
   const results = db.prepare(query).all(...params)
 
   if (results.length === 0) {
-    const msg = model ? `No online provider found for model "${model}"` : 'No online providers found'
+    const msg = model ? `No online provider found for model "${String(model).slice(0, 80).replace(/[^\w/.:@-]/g, '')}"` : 'No online providers found'
     return res.status(404).json({ error: msg })
   }
 

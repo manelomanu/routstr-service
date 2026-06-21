@@ -3,6 +3,7 @@ import db from './db.js'
 
 // Confirmed from Routstr source code (routstr-core/routstr/nostr/discovery.py)
 const RELAYS = [
+  'wss://relay.airadar.fyi',
   'wss://relay.routstr.com',
   'wss://relay.nostr.band',
   'wss://relay.damus.io',

@@ -1,3 +1,5 @@
+import { assertPublicUrl } from './net-guard.js'
+
 const OR_BASE = 'https://openrouter.ai/api/v1'
 
 function orHeaders(title = 'AIRadar') {
@@ -95,7 +97,8 @@ export async function askVision(imageUrl, question, model = 'openai/gpt-4o-mini'
 
 // ── STT (audio URL → transcript) ──────────────────────────────────────────────
 export async function transcribeAudio(audioUrl, model = 'openai/whisper-1') {
-  const audioRes = await fetch(audioUrl, { signal: AbortSignal.timeout(30000) })
+  await assertPublicUrl(audioUrl)
+  const audioRes = await fetch(audioUrl, { signal: AbortSignal.timeout(30000), redirect: 'error' })
   if (!audioRes.ok) throw new Error(`Could not fetch audio: HTTP ${audioRes.status}`)
   const audioBuffer = await audioRes.arrayBuffer()
   const contentType = audioRes.headers.get('content-type') || 'audio/mpeg'
@@ -155,8 +158,9 @@ export async function detectLanguage(text) {
 }
 
 export async function classify(text, labels) {
+  const safeLabels = labels.slice(0, 20).map(l => String(l).slice(0, 100))
   const raw = await llm(
-    `Classify into one of [${labels.join(', ')}]. Return ONLY JSON: {"label":"chosen","confidence":0.0-1.0}`,
+    `Classify into one of these categories: ${JSON.stringify(safeLabels)}. Return ONLY JSON: {"label":"chosen","confidence":0.0-1.0}`,
     text, 'openai/gpt-4o-mini', 80
   )
   return tryJson(raw, { label: raw, confidence: null })

@@ -131,11 +131,12 @@ db.exec(`
     completed_at INTEGER
   );
 
-  CREATE TABLE IF NOT EXISTS iota_txs (
-    tx_hash      TEXT PRIMARY KEY,
-    from_address TEXT,
-    amount_base  TEXT,
-    used_at      INTEGER NOT NULL
+  CREATE TABLE IF NOT EXISTS tangle_anchors (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        INTEGER NOT NULL,
+    data_hash TEXT    NOT NULL,
+    block_id  TEXT    NOT NULL,
+    agents    INTEGER DEFAULT 0
   );
 `)
 

@@ -46,6 +46,7 @@ function getX402Requirements(tier) {
     { scheme: 'exact', network: 'polygon',        maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',         extra: { name: 'USD Coin', version: '2' } },
     { scheme: 'exact', network: 'eip155:42161',   maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: EVM_ADDRESS, maxTimeoutSeconds: 300, asset: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',         extra: { name: 'USD Coin', version: '2' } },
     { scheme: 'exact', network: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: SOL_ADDRESS, maxTimeoutSeconds: 300, asset: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', extra: {} },
+    { scheme: 'exact', network: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', maxAmountRequired: amount, resource, description, mimeType: 'application/json', payTo: SOL_ADDRESS, maxTimeoutSeconds: 300, asset: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', extra: {} },
   ]
 }
 
@@ -59,7 +60,13 @@ async function forwardToOpenRouter(body) {
       'HTTP-Referer':   'https://airadar.fyi',
       'X-Title':        'AIRadar Gateway',
     },
-    body: JSON.stringify({ ...body, stream: false }),
+    body: JSON.stringify({
+      model:       body.model,
+      messages:    body.messages,
+      temperature: body.temperature,
+      max_tokens:  body.max_tokens,
+      stream:      false,
+    }),
     signal: AbortSignal.timeout(60000),
   })
   return res
@@ -88,7 +95,13 @@ async function forwardBest(body) {
       const res = await fetch(`${base}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...body, stream: false }),
+        body: JSON.stringify({
+          model:       body.model,
+          messages:    body.messages,
+          temperature: body.temperature,
+          max_tokens:  body.max_tokens,
+          stream:      false,
+        }),
         signal: AbortSignal.timeout(30_000),
       })
       if (res.ok) {
@@ -149,8 +162,12 @@ export function registerGatewayRoutes(app, nwcClient) {
           try {
             const lookup = await nwcClient.lookupInvoice({ payment_hash: paymentHash })
             if (lookup.preimage || lookup.settled_at) {
-              db.prepare('UPDATE invoices SET used_at = ? WHERE payment_hash = ?')
-                .run(Math.floor(Date.now() / 1000), paymentHash)
+              const mark = db.prepare(
+                'UPDATE invoices SET used_at = ? WHERE payment_hash = ? AND used_at IS NULL'
+              ).run(Math.floor(Date.now() / 1000), paymentHash)
+              if (mark.changes === 0) {
+                return res.status(402).json({ error: 'Invoice already used — pay a new one.' })
+              }
 
               try {
                 const { res: upstream, provider, network } = await forwardBest(body)
@@ -169,22 +186,26 @@ export function registerGatewayRoutes(app, nwcClient) {
       }
     }
 
-    // ── 2. Check x402 (USDC) ───────────────────────────────────────────
+    // ── 2. Check x402 (USDC / USDT Solana / …) ────────────────────────
     const xPayment = req.headers['x-payment']
     if (xPayment) {
       try {
         const payload = decodePaymentSignatureHeader(xPayment)
-        const matchedReq = x402Reqs.find(r => r.network === payload.network && r.scheme === payload.scheme)
-        if (!matchedReq) throw new Error(`No requirement found for scheme=${payload.scheme} network=${payload.network}`)
-        const verifyResult = await facilitator.verify(payload, matchedReq)
-        if (verifyResult.isValid) {
-          await facilitator.settle(payload, matchedReq)
-
-          // Write settlement record before forwarding so any upstream failure is auditable
-          const settleId = createHash('sha256').update(xPayment).digest('hex').slice(0, 40)
-          db.prepare(
+        const candidates = x402Reqs.filter(r => r.network === payload.network && r.scheme === payload.scheme)
+        if (!candidates.length) throw new Error(`No requirement found for scheme=${payload.scheme} network=${payload.network}`)
+        let matchedReq, verifyResult
+        for (const candidate of candidates) {
+          verifyResult = await facilitator.verify(payload, candidate)
+          if (verifyResult.isValid) { matchedReq = candidate; break }
+        }
+        if (matchedReq) {
+          const settleId = createHash('sha256').update(xPayment).digest('hex')
+          const now = Math.floor(Date.now() / 1000)
+          const dedup = db.prepare(
             'INSERT OR IGNORE INTO invoices (payment_hash, bolt11, created_at, used_at) VALUES (?, ?, ?, ?)'
-          ).run(settleId, `x402:${payload.network}`, Math.floor(Date.now() / 1000), Math.floor(Date.now() / 1000))
+          ).run(settleId, `x402:${payload.network}`, now, now)
+          if (dedup.changes === 0) throw new Error('x402 payment already processed')
+          await facilitator.settle(payload, matchedReq)
 
           try {
             const { res: upstream, provider, network } = await forwardBest(body)
@@ -193,7 +214,7 @@ export function registerGatewayRoutes(app, nwcClient) {
             return res.set('X-Served-By', `${network}/${provider}`).json(data)
           } catch (e) {
             console.error('Gateway forward error (x402):', e.message)
-            return res.status(502).json({ error: `Upstream provider error. Your USDC payment was settled (ref: ${settleId}). Contact support.` })
+            return res.status(502).json({ error: `Upstream provider error. Your stablecoin payment was settled (ref: ${settleId}). Contact support.` })
           }
         }
       } catch (e) {

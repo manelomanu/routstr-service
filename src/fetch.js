@@ -1,12 +1,9 @@
 import { parseHTML } from 'linkedom'
 import { Readability } from '@mozilla/readability'
-
-const ALLOWED_PROTOCOLS = new Set(['http:', 'https:'])
+import { assertPublicUrl } from './net-guard.js'
 
 export async function fetchUrl(url) {
-  let parsed
-  try { parsed = new URL(url) } catch { throw new Error('Invalid URL') }
-  if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) throw new Error('Only http/https URLs are allowed')
+  await assertPublicUrl(url)
 
   const res = await fetch(url, {
     headers: {
@@ -14,7 +11,7 @@ export async function fetchUrl(url) {
       'Accept': 'text/html,application/xhtml+xml,application/json,*/*',
     },
     signal: AbortSignal.timeout(15000),
-    redirect: 'follow',
+    redirect: 'error',
   })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
 

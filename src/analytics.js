@@ -142,7 +142,7 @@ const ONE_WEEK = 86400 * 7
 function since(seconds) { return Math.floor(Date.now() / 1000) - seconds }
 
 function requireAdmin(req, res, next) {
-  const key = req.headers['x-analytics-key'] || req.query._key
+  const key = req.headers['x-analytics-key']
   if (!process.env.ANALYTICS_KEY || key !== process.env.ANALYTICS_KEY) {
     return res.status(404).json({ error: 'Not found' })
   }

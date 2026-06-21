@@ -520,8 +520,17 @@ function createMcpServer() {
 
 const activeTransports = {}
 
+function checkMcpAuth(req, res) {
+  if (!process.env.MCP_TOKEN) return true
+  const auth = req.headers.authorization
+  if (auth === `Bearer ${process.env.MCP_TOKEN}`) return true
+  res.status(401).json({ error: 'Unauthorized — set Authorization: Bearer <MCP_TOKEN>' })
+  return false
+}
+
 export function registerMcpRoutes(app) {
   app.get('/mcp', async (req, res) => {
+    if (!checkMcpAuth(req, res)) return
     const transport = new SSEServerTransport('/mcp/message', res)
     activeTransports[transport.sessionId] = transport
     req.on('close', () => { delete activeTransports[transport.sessionId] })

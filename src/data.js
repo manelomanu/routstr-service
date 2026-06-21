@@ -1,6 +1,7 @@
 import { promises as dns } from 'dns'
 import Parser from 'rss-parser'
 import { searchWeb } from './search.js'
+import { assertPublicUrl } from './net-guard.js'
 
 const rss = new Parser({ timeout: 8000 })
 
@@ -178,6 +179,7 @@ export async function getGithubRepo(repoPath) {
 
 // ── RSS/Atom feed ─────────────────────────────────────────────────────────────
 export async function parseFeed(feedUrl, limit = 10) {
+  await assertPublicUrl(feedUrl)
   const feed = await rss.parseURL(feedUrl)
   return {
     title: feed.title || '',
