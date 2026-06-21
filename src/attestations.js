@@ -12,7 +12,7 @@
  * NOT the same as Vokter's "trusted" space — these mean "good uptime", nothing more.
  */
 
-import { finalizeEvent, SimplePool, getPublicKey } from 'nostr-tools'
+import { finalizeEvent, Relay, getPublicKey } from 'nostr-tools'
 import db from './db.js'
 
 const RELAYS = [
@@ -86,6 +86,17 @@ function buildAttestation(provider, sk) {
   }, sk)
 }
 
+async function publishToRelay(relayUrl, event) {
+  try {
+    const relay = await Relay.connect(relayUrl)
+    await relay.publish(event)
+    relay.close()
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function publishCycle(sk) {
   const providers = stmtProviders.all(MIN_CHECK_COUNT, MIN_UPTIME_PCT)
 
@@ -95,25 +106,22 @@ async function publishCycle(sk) {
   }
 
   console.log(`[attestations] Publishing vouches for ${providers.length} providers`)
-  const pool = new SimplePool()
   let published = 0
 
   for (const provider of providers) {
     try {
       const event = buildAttestation(provider, sk)
-      // pool.publish() already returns one promise per relay; await them
-      // directly. Wrapping in RELAYS.map() makes an array-of-arrays, which
-      // Promise.allSettled treats as already-settled — the publishes would not
-      // be awaited and pool.destroy() below could tear down mid-send.
-      await Promise.allSettled(pool.publish(RELAYS, event))
+      // Publish to each relay with individual error handling — avoids SimplePool's
+      // bug where a late rate-limit CLOSED message calls ep.reject on a resolved
+      // promise reference, crashing the process with an uncaught exception.
+      await Promise.allSettled(RELAYS.map(r => publishToRelay(r, event)))
       published++
-      await new Promise(r => setTimeout(r, 150))
     } catch (e) {
       console.error(`[attestations] Failed for ${provider.name}:`, e.message)
     }
+    await new Promise(r => setTimeout(r, 500))
   }
 
-  pool.destroy()
   console.log(`[attestations] Done — ${published}/${providers.length} vouches published`)
 }
 
