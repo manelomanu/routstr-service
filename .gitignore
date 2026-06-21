@@ -4,3 +4,5 @@ providers.db
 *.db
 *.deb
 sdk-python/dist/
+__pycache__/
+*.pyc
