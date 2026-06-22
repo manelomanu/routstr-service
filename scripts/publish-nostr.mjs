@@ -69,7 +69,7 @@ function buildProfile(pubkey) {
     tags: [],
     content: JSON.stringify({
       name:    'AIRadar',
-      about:   'Decentralized AI provider directory. 77+ providers, 340+ models. Pay per query with Lightning (L402) or USDC (x402) — no account, no API key.',
+      about:   'Decentralized AI directory & inference gateway. 90+ providers, 1,900+ models. Pay per call with Lightning (L402) or USDC (x402) — no account, no API key.',
       website: 'https://airadar.fyi',
       picture: 'https://airadar.fyi/logo.png',
       nip05:   'airadar@airadar.fyi',
@@ -79,25 +79,23 @@ function buildProfile(pubkey) {
 }
 
 function buildAnnouncement(pubkey) {
-  const text = `⚡ AIRadar — Decentralized AI Provider Directory
+  const text = `⚡ AIRadar — Decentralized AI Directory & Inference Gateway
 
-Find, compare, and route to 77+ Nostr/Routstr AI providers and 340+ models. Pay per query with Lightning (L402) or USDC (x402). No account, no API key, no subscription.
+Index of 90+ AI providers (Routstr + AntSeed) and 1,900+ models. Run inference or query the directory, pay per call with Lightning (L402) or USDC (x402) — no account, no API key, no subscription.
 
 🔌 What you get:
-• GET /providers — full directory sorted by uptime + speed
-• GET /intelligence — trending models, reliability, latencies
-• POST /reputation/compare — pick the best agent before paying
-• GET /agentanalysis/:id — bot detection, coordination, volume anomaly
-• GET /marketplace — browse agents offering services
-• POST /v1/chat/completions — inference gateway (340+ models)
+• POST /v1/chat/completions — gateway to 1,900+ models, pay-per-call
+• GET  /providers      — directory sorted by uptime + speed
+• GET  /intelligence   — trending models, reliability, latencies
+• GET  /reputation/:id — agent reputation
+• GET  /marketplace    — agents offering services
 
 📡 Own relay: wss://relay.airadar.fyi
-🐍 Python SDK: pip install airadar-sdk
-📖 Docs: https://airadar.fyi
+🐍 pip install airadar-sdk
+📖 https://airadar.fyi — machine-readable at /info
 
-Designed for autonomous AI agents — machine-readable at /info
-
-#nostr #ai #lightning #l402 #routstr #bitcoin #llm`
+Built for autonomous AI agents.
+#nostr #ai #lightning #l402 #x402 #bitcoin #llm`
 
   return {
     kind: 1,
@@ -108,7 +106,7 @@ Designed for autonomous AI agents — machine-readable at /info
       ['t', 'ai'],
       ['t', 'lightning'],
       ['t', 'l402'],
-      ['t', 'routstr'],
+      ['t', 'x402'],
       ['t', 'bitcoin'],
       ['t', 'llm'],
       ['r', 'https://airadar.fyi'],
@@ -188,7 +186,6 @@ const pool   = new SimplePool()
 const events = [
   buildProfile(pubkey),
   buildAnnouncement(pubkey),
-  buildProviderAnnouncement(pubkey),
 ].map(template => finalizeEvent(template, sk))
 
 for (const event of events) {
